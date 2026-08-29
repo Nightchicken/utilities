@@ -13,40 +13,125 @@
 #include <time.h>
 #include <unistd.h>
 
-// ANSI control sequences. "\x1b[" is CSI (Control Sequence Introducer): the
-// terminal reads what follows as a command instead of printing it. A trailing
-// "?" parameter marks a private/DEC mode, where 'h' means set and 'l' means
-// reset -- that is the only reason ALT_ON and ALT_OFF differ by one letter.
-//
-// Two more sequences are built by hand in screen_present() rather than being
-// macros here, because their numbers come from data:
-//   "\x1b[<row>;<col>H"        move cursor (1-based, row first)
-//   "\x1b[38;2;<r>;<g>;<b>m"   set foreground to a 24-bit colour
-//   "\x1b[48;2;<r>;<g>;<b>m"   same for background ("49m" resets it to default)
-// The 38/48 codes take a colour-space selector; "2" means direct RGB, as
-// opposed to "5" which would mean a 256-colour palette index.
-#define TERM_ALT_ON "\x1b[?1049h"   // switch to the alternate screen buffer
-#define TERM_ALT_OFF "\x1b[?1049l"  // switch back, restoring the user's scrollback
-#define TERM_HIDE_CUR "\x1b[?25l"   // hide the hardware cursor (it would flicker)
+/**
+ * @file terminal.h
+ * @brief Full-screen terminal renderer: raw-mode input, a frame clock, and a
+ *        double-buffered character surface that diffs itself to ANSI escapes.
+ *
+ * Three independent pieces, usable separately:
+ * - **Terminal setup** (`term_*`): raw mode, the alternate screen, size
+ *   queries and non-blocking key reads.
+ * - **Frame clock** (::FrameClock): absolute-deadline pacing that does not
+ *   drift and absorbs render cost into the frame budget.
+ * - **Screen** (::Screen): a w-by-h grid of characters with 24-bit colours,
+ *   drawn into freely and then sent to the terminal as the minimal set of
+ *   escape sequences, in one write() per frame.
+ *
+ * Typical use:
+ * @code
+ *     Arena a = arena_create(screen_arena_bytes(120, 40) + 1024);
+ *     Screen *s = screen_create(&a, 120, 40);
+ *
+ *     FrameClock fc;
+ *     frame_clock_init(&fc, 60);
+ *     term_init();
+ *
+ *     char keys[32];
+ *     for (int running = 1; running; ) {
+ *         int n = term_read_keys(keys, sizeof keys);
+ *         for (int i = 0; i < n; i++)
+ *             if (keys[i] == 'q') running = 0;   // Ctrl-C will NOT quit
+ *
+ *         screen_clear(s, ' ', RGB(200,200,200), BG_NONE);  // every frame
+ *         screen_text(s, 2, 1, "hello", RGB(255,80,80));
+ *         screen_present(s);
+ *
+ *         frame_wait(&fc);
+ *     }
+ *     term_restore();
+ *     arena_destroy(&a);
+ * @endcode
+ *
+ * **ANSI control sequences.** "\x1b[" is CSI (Control Sequence Introducer):
+ * the terminal reads what follows as a command instead of printing it. A
+ * leading "?" parameter marks a private/DEC mode, where 'h' means set and 'l'
+ * means reset -- that is the only reason ::TERM_ALT_ON and ::TERM_ALT_OFF
+ * differ by one letter. Two more sequences are built by hand in
+ * screen_present() rather than being macros here, because their numbers come
+ * from data:
+ * @verbatim
+ *   "\x1b[<row>;<col>H"        move cursor (1-based, row first)
+ *   "\x1b[38;2;<r>;<g>;<b>m"   set foreground to a 24-bit colour
+ *   "\x1b[48;2;<r>;<g>;<b>m"   same for background ("49m" resets to default)
+ * @endverbatim
+ * The 38/48 codes take a colour-space selector; "2" means direct RGB, as
+ * opposed to "5" which would mean a 256-colour palette index.
+ *
+ * @warning term_init() disables ISIG, so **Ctrl-C no longer kills the
+ *          process** -- it arrives as a 0x03 byte. Your loop owns quitting,
+ *          and must call term_restore() on every exit path or leave the user
+ *          in a raw-mode shell with no echo.
+ * @warning Defines a type named `Screen`, which collides with the unrelated
+ *          `Screen` in raster.h. Only one of the two headers can be included
+ *          in a given translation unit.
+ * @note POSIX-only (termios, ioctl, clock_nanosleep). Needs `-std=gnu11` or
+ *       `-D_POSIX_C_SOURCE=200809L`; strict `-std=c11` hides CLOCK_MONOTONIC
+ *       and TIMER_ABSTIME and fails to compile.
+ * @note Cells are single bytes, so the surface is ASCII only -- a multi-byte
+ *       UTF-8 glyph would span several cells and break the per-cell diff.
+ */
+
+/** @brief Switch to the alternate screen buffer (a second, scrollback-less
+ *         screen), so quitting can restore the user's shell history untouched.
+ *         "?" marks a private DEC mode and the trailing 'h' means set. */
+#define TERM_ALT_ON "\x1b[?1049h"
+/** @brief Switch back from the alternate screen buffer, restoring the user's
+ *         scrollback. Same mode as ::TERM_ALT_ON with 'l' (reset) for 'h'. */
+#define TERM_ALT_OFF "\x1b[?1049l"
+/** @brief Hide the hardware cursor, which would otherwise flicker as the
+ *         renderer moves it around the screen. */
+#define TERM_HIDE_CUR "\x1b[?25l"
+/** @brief Show the hardware cursor again. Pair with ::TERM_HIDE_CUR. */
 #define TERM_SHOW_CUR "\x1b[?25h"
-#define TERM_CLEAR "\x1b[2J"        // erase the whole screen (2 = entire display)
-#define TERM_HOME "\x1b[H"          // cursor to row 1, col 1
-#define TERM_SGR_RESET "\x1b[0m"    // clear all colour/style attributes
+/** @brief Erase the whole screen (the "2" selects the entire display).
+ *         Does not move the cursor -- follow with ::TERM_HOME if you need
+ *         a known position. */
+#define TERM_CLEAR "\x1b[2J"
+/** @brief Move the cursor to row 1, column 1. Note ANSI positions are
+ *         1-based, not 0-based. */
+#define TERM_HOME "\x1b[H"
+/** @brief Clear all colour and style attributes. Emit this before leaving the
+ *         alternate screen, or styling leaks onto the restored shell prompt. */
+#define TERM_SGR_RESET "\x1b[0m"
 
 // ---------------------------------------------------------------------------
 // Terminal setup
 // ---------------------------------------------------------------------------
 
+/** @brief The terminal settings saved by term_init(), for term_restore() to
+ *         put back. File-scope, so only one terminal can be managed at a
+ *         time -- which is the only sane reading of "the" terminal anyway. */
 static struct termios term_saved;
+/** @brief Whether ::term_saved actually holds settings worth restoring. Stays
+ *         0 when stdin is not a terminal (piped input, a cron job), because
+ *         restoring garbage termios onto whatever stdin really is would be
+ *         worse than not restoring at all. */
 static int term_saved_valid = 0;
 
-// Current terminal size in character cells, via the "get window size" ioctl.
-// Returns 0 on success, -1 on error, leaving *cols/*rows untouched on failure so
-// the caller's defaults survive.
-//
-// The ws_col == 0 test matters as much as the -1 test: when stdout is a pipe or
-// a pty with no size set, the ioctl can succeed and still hand back zeros. A
-// caller that trusted that would compute an empty viewport and draw nothing.
+/**
+ * @brief Current terminal size in character cells, via the TIOCGWINSZ ioctl.
+ *
+ * @param cols Out-parameter for the width in columns. Left untouched on
+ *             failure, so a caller's default survives.
+ * @param rows Out-parameter for the height in rows. Same on failure.
+ * @return 0 on success, -1 on error.
+ *
+ * @note The ws_col == 0 test matters as much as the -1 test: when stdout is a
+ *       pipe or a pty with no size set, the ioctl can succeed and still hand
+ *       back zeros. A caller that trusted that would compute an empty viewport
+ *       and draw nothing.
+ * @note Queries stdout, not stdin, so it still works with stdin redirected.
+ */
 static inline int term_size(int *cols, int *rows) {
   struct winsize ws;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
@@ -56,13 +141,21 @@ static inline int term_size(int *cols, int *rows) {
   return 0;
 }
 
-// write() is allowed to transfer fewer bytes than asked (a full pipe buffer, or
-// a signal arriving mid-call), so a single call is not enough -- the loop keeps
-// pushing from where it left off. Giving up on n <= 0 means a closed or broken
-// stdout drops the frame instead of spinning forever.
-//
-// Note this is write(2), not stdio: bypassing FILE* buffering is what lets
-// screen_present() guarantee one frame reaches the terminal as one syscall.
+/**
+ * @brief Write exactly @p len bytes to stdout, looping over short writes.
+ *
+ * @param s   Bytes to write. Not treated as a string -- may contain NULs.
+ * @param len Number of bytes to write.
+ *
+ * @note write() is allowed to transfer fewer bytes than asked (a full pipe
+ *       buffer, or a signal arriving mid-call), so a single call is not
+ *       enough; the loop keeps pushing from where it left off.
+ * @note Gives up silently on n <= 0, so a closed or broken stdout drops the
+ *       frame instead of spinning forever. There is no error return.
+ * @note This is write(2), not stdio: bypassing FILE* buffering is what lets
+ *       screen_present() guarantee one frame reaches the terminal as one
+ *       syscall.
+ */
 static inline void term_write_n(const char *s, size_t len) {
   size_t off = 0;
   while (off < len) {
@@ -73,16 +166,40 @@ static inline void term_write_n(const char *s, size_t len) {
   }
 }
 
-// term_write_n() for a NUL-terminated string, used for the fixed escapes above.
+/**
+ * @brief term_write_n() for a NUL-terminated string.
+ *
+ * @param s String to write, without its terminator. Used for the fixed TERM_*
+ *          escapes above.
+ */
 static inline void term_write(const char *s) { term_write_n(s, strlen(s)); }
 
-// Put the terminal into raw mode for full-screen drawing, saving the previous
-// settings so term_restore() can hand the shell back the way it found it.
-//
-// By default a terminal is in "cooked" mode: the kernel buffers a whole line,
-// lets the user edit it with backspace, echoes it, and only releases it on
-// Enter -- all wrong for a game, which needs each keystroke the moment it is
-// pressed and owns every pixel of the screen itself.
+/**
+ * @brief Put the terminal into raw mode and switch to the alternate screen.
+ *
+ * Saves the previous settings first so term_restore() can hand the shell back
+ * the way it found it. By default a terminal is in "cooked" mode: the kernel
+ * buffers a whole line, lets the user edit it with backspace, echoes it, and
+ * only releases it on Enter -- all wrong for a full-screen program, which
+ * needs each keystroke the moment it is pressed and owns the whole screen.
+ *
+ * @note Takes no arguments and returns nothing: it acts on stdin/stdout and
+ *       reports no error. If stdin is not a terminal it degrades quietly
+ *       rather than failing.
+ * @note Disables ISIG, so **Ctrl-C no longer interrupts the process** -- it
+ *       arrives as an ordinary 0x03 byte from term_read_keys(). Your input
+ *       loop is now responsible for quitting, and for calling term_restore()
+ *       on the way out. A crash before that leaves the user's shell in raw
+ *       mode.
+ * @note Also disables IXON (Ctrl-S/Ctrl-Q flow control, which would look like
+ *       a hang), ICRNL (so Ctrl-M and Enter stay distinguishable), ECHO,
+ *       ICANON and OPOST (which would rewrite every "\n" to "\r\n" and
+ *       corrupt the byte-exact escapes the renderer emits).
+ * @note Sets VMIN=0/VTIME=1, so read() returns after at most ~100ms rather
+ *       than blocking forever; see term_read_keys().
+ *
+ * @see term_restore()
+ */
 static inline void term_init(void) {
   // Only mark the saved copy valid if the query worked. If stdin is not a
   // terminal (piped input, a cron job) tcgetattr fails, and restoring garbage
@@ -139,8 +256,18 @@ static inline void term_init(void) {
   term_write(TERM_CLEAR);
 }
 
-// Undo term_init(), in reverse order: drop colours before leaving the alternate
-// screen, so no styling leaks onto the restored shell prompt.
+/**
+ * @brief Undo term_init(), in reverse order.
+ *
+ * Drops colours before leaving the alternate screen, so no styling leaks onto
+ * the restored shell prompt, then puts back the saved termios.
+ *
+ * @note Safe to call twice: the second call clears attributes again but skips
+ *       the tcsetattr, guarded by ::term_saved_valid.
+ * @note Safe to call without a matching term_init(); it just restores nothing.
+ * @note Call this on *every* exit path, including error paths and signal
+ *       handlers, or the user is left in a raw-mode shell with no echo.
+ */
 static inline void term_restore(void) {
   term_write(TERM_SGR_RESET);
   term_write(TERM_SHOW_CUR);
@@ -150,42 +277,66 @@ static inline void term_restore(void) {
     term_saved_valid = 0; // guard against a double restore
   }
 }
-//------------------------------------------------------------------------------
-// Returns number of inputs
-// Drain every key byte already queued into `buf`, returning the count. With the
-// VMIN=0/VTIME=1 raw mode above this blocks for at most ~100ms, so 0 means
-// nothing is being pressed. Terminals have no key-up event: a held key shows up
-// as OS auto-repeat, i.e. repeated bytes arriving on successive calls.
-//------------------------------------------------------------------------------
+/**
+ * @brief Drain every key byte already queued.
+ *
+ * @param buf Destination buffer for the raw bytes. Not NUL-terminated on
+ *            return, and not a string -- one keypress can produce several
+ *            bytes (an arrow key arrives as the three bytes "\x1b[A").
+ * @param cap Size of @p buf in bytes. Anything beyond this stays queued for
+ *            the next call.
+ * @return Number of bytes read, 0 if nothing was pressed. Never negative:
+ *         read errors are reported as 0.
+ *
+ * @note With the VMIN=0/VTIME=1 raw mode set by term_init() this blocks for at
+ *       most ~100ms, so 0 genuinely means "nothing is being pressed" rather
+ *       than "not yet".
+ * @note Terminals have no key-up event. A held key shows up as OS auto-repeat,
+ *       i.e. repeated bytes arriving on successive calls -- so you cannot ask
+ *       whether a key is currently down, only whether it repeated recently.
+ */
 static inline int term_read_keys(char *buf, size_t cap) {
   ssize_t n = read(STDIN_FILENO, buf, cap);
   return n > 0 ? (int)n : 0;
 }
 
-// ---------------------------------------------------------------------------
-// Frame clock
-//
-// The obvious way to pace a loop is to sleep a fixed amount at the end of each
-// frame. That is wrong, and visibly so: the real interval becomes
-// "render time + delay", so every wobble in render cost shows up as a wobble in
-// frame rate. Rendering a busy frame makes that frame *later*, not shorter.
-//
-// Instead this tracks an absolute deadline and sleeps until it. Render cost is
-// absorbed into the frame's budget rather than added on top, so the interval
-// stays flat as long as the work fits. Measured: 0.016ms of jitter at 60fps
-// with 1-9ms of deliberately varied render cost per frame.
-//
-// The deadline is stepped by exactly frame_ns each time, never recomputed from
-// "now", so rounding errors cannot accumulate into drift.
-// ---------------------------------------------------------------------------
+/**
+ * @brief Absolute-deadline frame pacer.
+ *
+ * The obvious way to pace a loop is to sleep a fixed amount at the end of each
+ * frame. That is wrong, and visibly so: the real interval becomes
+ * "render time + delay", so every wobble in render cost shows up as a wobble
+ * in frame rate. Rendering a busy frame makes that frame *later*, not shorter.
+ *
+ * Instead this tracks an absolute deadline and sleeps until it, so render cost
+ * is absorbed into the frame's budget rather than added on top. Measured:
+ * 0.016ms of jitter at 60fps with 1-9ms of deliberately varied render cost.
+ *
+ * @var FrameClock::next
+ *   Absolute CLOCK_MONOTONIC time the next frame should begin. Stepped by
+ *   exactly @ref FrameClock::frame_ns each time, never recomputed from "now",
+ *   so rounding errors cannot accumulate into drift.
+ * @var FrameClock::frame_ns
+ *   Nanoseconds per frame -- the amount `next` steps by. Set from the fps
+ *   passed to frame_clock_init().
+ */
 typedef struct FrameClock {
   struct timespec next; // absolute time the next frame should begin
   long frame_ns;        // nanoseconds per frame, the amount `next` steps by
 } FrameClock;
 
 
-// Start the clock at `fps`, taking now as the first frame boundary. A
-// non-positive fps falls back to 60.
+/**
+ * @brief Start the clock, taking now as the first frame boundary.
+ *
+ * @param fc  Clock to initialise. Both fields are overwritten.
+ * @param fps Target frames per second. A non-positive value falls back to 60
+ *            rather than erroring. Note the period is truncated to whole
+ *            nanoseconds, so odd rates are approximate.
+ *
+ * @note Uses CLOCK_MONOTONIC, not CLOCK_REALTIME: it cannot jump backwards
+ *       when NTP adjusts the wall clock or the user changes timezone.
+ */
 static inline void frame_clock_init(FrameClock *fc, int fps) {
   // CLOCK_MONOTONIC, not CLOCK_REALTIME: it cannot jump backwards when NTP
   // adjusts the wall clock or the user changes timezone mid-game.
@@ -193,9 +344,22 @@ static inline void frame_clock_init(FrameClock *fc, int fps) {
   clock_gettime(CLOCK_MONOTONIC, &fc->next);
 }
 
-// Block until the next frame boundary. Returns 1 normally, or 0 if the frame
-// just rendered overran its budget -- a signal that the loop is not keeping up,
-// which a caller can use to skip non-essential work and catch back up.
+/**
+ * @brief Block until the next frame boundary.
+ *
+ * @param fc Clock to wait on. Its deadline is advanced by one frame, or
+ *           rebased to now if the last frame overran.
+ * @return 1 normally; 0 if the frame just rendered overran its budget. A 0 is
+ *         a signal that the loop is not keeping up, which a caller can use to
+ *         skip non-essential work and catch back up.
+ *
+ * @note On overrun the deadline is rebased to now and the cost is taken once,
+ *       rather than leaving a stale deadline that would make the next several
+ *       frames fire back-to-back trying to "catch up".
+ * @note Sleeps with TIMER_ABSTIME, i.e. *until* a point in time rather than
+ *       *for* a duration, which closes the race where the time spent computing
+ *       the remaining delay is itself not counted.
+ */
 static inline int frame_wait(FrameClock *fc) {
   struct timespec now;
 
@@ -226,68 +390,162 @@ static inline int frame_wait(FrameClock *fc) {
   return 1;
 }
 // ---------------------------------------------------------------------------
-// Screen
-// Used for rendering graphics to terminal
-//
-// Double buffered, structure of arrays, arena allocated.
-//
-// Two sets of planes: the ones being drawn into, and the ones the terminal is
-// currently showing. present() compares them to work out the smallest set of
-// escape sequences that turns one into the other, emits that in a single
-// write(), then swaps the two sets of pointers.
-//
-// Data is stored as parallel planes rather than an array of cell structs, so
-// the comparison loop walks three tight contiguous arrays instead of striding
-// over interleaved fields.
+// Screen -- see the Screen struct below for how the double buffering works
 // ---------------------------------------------------------------------------
 
-// Packed 0x00RRGGBB in a single word. present() compares the colour of every
-// visible cell against the previous frame, so this is the hottest comparison in
-// the renderer: as one uint32 it is a single instruction, where a {r,g,b}
-// struct would be three byte loads and three branches.
+/**
+ * @brief A packed colour, 0x00RRGGBB in a single word.
+ *
+ * Build one with ::RGB for a foreground, or ::BG / ::BG_NONE for a background;
+ * unpack with ::COLOR_R, ::COLOR_G, ::COLOR_B.
+ *
+ * @note screen_present() compares the colour of every visible cell against the
+ *       previous frame, so this is the hottest comparison in the renderer: as
+ *       one uint32 it is a single instruction, where a {r,g,b} struct would be
+ *       three byte loads and three branches.
+ * @note Bit 24 is not part of the colour -- see ::COLOR_SET.
+ */
 typedef uint32_t Color;
 
+/**
+ * @brief Pack three 0..255 channels into a ::Color.
+ *
+ * @param rr Red channel. Cast through unsigned char, so values outside 0..255
+ *           wrap rather than clamp.
+ * @param gg Green channel, same treatment.
+ * @param bb Blue channel, same treatment.
+ * @return A ::Color with bit 24 clear.
+ *
+ * @note Use this for foregrounds. For a background use ::BG instead, which
+ *       also sets the ::COLOR_SET flag -- passing an RGB() value as a
+ *       background reads as ::BG_NONE if it happens to be zero.
+ * @warning Function-like macro: each argument is evaluated more than once, so
+ *          do not pass anything with side effects.
+ */
 #define RGB(rr, gg, bb)                                                        \
   ((Color)(((uint32_t)(unsigned char)(rr) << 16) |                             \
            ((uint32_t)(unsigned char)(gg) << 8) |                              \
            (uint32_t)(unsigned char)(bb)))
 
-// A packed colour only needs 24 bits, so bit 24 is free to carry a flag.
-//
-// It answers a question RGB alone cannot: "no background" and "a background
-// that happens to be black" are different instructions to the terminal -- one
-// leaves whatever the user's theme uses, the other paints black. Without the
-// flag, bg == 0 would be ambiguous. Keeping it in the spare bit rather than a
-// parallel flags plane means the compare still reads one word per cell.
+/**
+ * @brief Flag in bit 24 marking a background colour as actually set.
+ *
+ * A packed colour only needs 24 bits, so bit 24 is free to carry a flag. It
+ * answers a question RGB alone cannot: "no background" and "a background that
+ * happens to be black" are different instructions to the terminal -- one
+ * leaves whatever the user's theme uses, the other paints black. Without the
+ * flag, bg == 0 would be ambiguous.
+ *
+ * @note Kept in the spare bit rather than a parallel flags plane so the
+ *       per-cell compare still reads one word.
+ */
 #define COLOR_SET 0x01000000u
+/**
+ * @brief Pack three 0..255 channels into a background ::Color.
+ *
+ * @param rr Red channel.
+ * @param gg Green channel.
+ * @param bb Blue channel.
+ * @return ::RGB with ::COLOR_SET applied, so it is distinguishable from
+ *         ::BG_NONE even when the colour is pure black.
+ *
+ * @warning Function-like macro: arguments are evaluated more than once.
+ */
 #define BG(rr, gg, bb) ((Color)(COLOR_SET | RGB(rr, gg, bb)))
+/** @brief "No background": leave whatever the user's terminal theme paints.
+ *         Distinct from BG(0,0,0), which actively paints black. */
 #define BG_NONE ((Color)0)
 
+/** @brief Extract the red channel (0..255) from a ::Color.
+ *  @param c The packed colour. Evaluated more than once. */
 #define COLOR_R(c) ((unsigned)(((c) >> 16) & 0xFFu))
+/** @brief Extract the green channel (0..255) from a ::Color.
+ *  @param c The packed colour. Evaluated more than once. */
 #define COLOR_G(c) ((unsigned)(((c) >> 8) & 0xFFu))
+/** @brief Extract the blue channel (0..255) from a ::Color. Masks off the
+ *         ::COLOR_SET flag along with the other channels.
+ *  @param c The packed colour. Evaluated more than once. */
 #define COLOR_B(c) ((unsigned)((c) & 0xFFu))
 
-// When the scan finds changed cells with a few unchanged ones between them, it
-// can either end the span and pay for a fresh cursor-position escape
-// ("\x1b[12;34H", ~9 bytes), or redraw the unchanged cells and stay put.
-// Below this many unchanged cells it bridges the gap instead of jumping.
-//
-// Which is actually cheaper depends on colour, and the two cases pull opposite
-// ways. If the bridged cells share the colour of the cells around them they
-// cost ~1 byte each and bridging wins easily. If they differ, the bridge also
-// pays a colour escape switching away and another switching back (~38 bytes),
-// and jumping would have been cheaper.
-//
-// Measured over 200 frames of 60 scattered changes on a 200x50 surface, total
-// bytes emitted:
-//         gap=0     gap=4     gap=8    gap=16
-//   same  233017    226773    224968   232025     (higher gap better)
-//   diff  436725    440001    446492   467727     (lower gap better)
-// 4 is the compromise: within 1% of optimal in both directions. There is no
-// setting that wins both, so this is not worth tuning further unless a specific
-// screen is known to be one case or the other.
+
+/**
+ * @brief How many unchanged cells screen_present() will redraw to bridge a gap
+ *        rather than emitting a fresh cursor-position escape.
+ *
+ * When the scan finds changed cells with a few unchanged ones between them, it
+ * can either end the span and pay for a cursor move ("\x1b[12;34H", ~9 bytes),
+ * or redraw the unchanged cells and stay put. Below this many it bridges.
+ *
+ * Which is cheaper depends on colour, and the two cases pull opposite ways. If
+ * the bridged cells share the colour around them they cost ~1 byte each and
+ * bridging wins easily. If they differ, the bridge also pays a colour escape
+ * switching away and another switching back (~38 bytes), and jumping would
+ * have been cheaper.
+ *
+ * Measured over 200 frames of 60 scattered changes on a 200x50 surface, total
+ * bytes emitted:
+ * @verbatim
+ *         gap=0     gap=4     gap=8    gap=16
+ *   same  233017    226773    224968   232025   (higher gap better)
+ *   diff  436725    440001    446492   467727   (lower gap better)
+ * @endverbatim
+ * 4 is the compromise: within 1% of optimal in both directions. No setting
+ * wins both, so this is not worth tuning unless a specific screen is known to
+ * be one case or the other.
+ */
 #define SCREEN_SPAN_GAP 4
 
+/**
+ * @brief Double-buffered terminal drawing surface, structure of arrays,
+ *        arena allocated.
+ *
+ * Two sets of planes: the ones being drawn into, and the ones the terminal is
+ * currently showing. screen_present() compares them to work out the smallest
+ * set of escape sequences that turns one into the other, emits that in a
+ * single write(), then swaps the two sets of pointers.
+ *
+ * Data is stored as parallel planes rather than an array of cell structs, so
+ * the comparison loop walks tight contiguous arrays instead of striding over
+ * interleaved fields.
+ *
+ * @var Screen::w
+ *   Surface width in cells, fixed at creation and independent of the terminal
+ *   window -- present() clips to whichever is smaller rather than reflowing.
+ * @var Screen::h
+ *   Surface height in cells, same.
+ * @var Screen::n
+ *   w * h, cached because every plane is indexed y * w + x.
+ * @var Screen::characters
+ *   Front plane: the glyph in each cell. This is what you draw into.
+ * @var Screen::fg
+ *   Front plane: each cell's foreground colour.
+ * @var Screen::bg
+ *   Front plane: each cell's background, or ::BG_NONE for the terminal default.
+ * @var Screen::swap_characters
+ *   Swap plane: the glyphs the terminal is currently showing.
+ * @var Screen::swap_fg
+ *   Swap plane: the foregrounds currently shown.
+ * @var Screen::swap_bg
+ *   Swap plane: the backgrounds currently shown. The diff between the two sets
+ *   of planes is exactly what has to be sent.
+ * @var Screen::out
+ *   Escape-sequence scratch buffer the frame is assembled in, sized for a
+ *   worst-case full repaint.
+ * @var Screen::out_cap
+ *   Size of @ref Screen::out, from screen_out_bytes(). Never exceeded, and
+ *   never bounds checked in the inner loop for that reason.
+ * @var Screen::prev_valid
+ *   False until the first present, and cleared by screen_invalidate(). While
+ *   false the swap planes describe nothing and the next frame is a full
+ *   repaint rather than a diff.
+ * @var Screen::last_cols
+ *   Terminal width at the last present, used to detect a resize.
+ * @var Screen::last_rows
+ *   Terminal height at the last present, same.
+ *
+ * @warning This name collides with the unrelated `Screen` in raster.h -- the
+ *          two headers cannot be included in the same translation unit.
+ */
 typedef struct Screen {
   // Surface size in cells. This is the size of the drawing surface, fixed at
   // creation, and is independent of the terminal window -- present() clips to
@@ -319,38 +577,62 @@ typedef struct Screen {
   int last_cols, last_rows; // viewport at last present, to detect a resize
 } Screen;
 
-// Size of the scratch buffer the frame is assembled in. This has to be a hard
-// upper bound, not an estimate: present() writes into it without bounds checks,
-// so under-sizing it is a buffer overflow.
-//
-// Worst case for one cell is every escape firing at once:
-//   "\x1b[999;999H"           cursor move          ~12
-//   "\x1b[38;2;255;255;255m"  foreground            19
-//   "\x1b[48;2;255;255;255m"  background            19
-//   the character itself                             1
-// which is 51; 56 rounds up with room to spare. Per row adds 16 for a leading
-// cursor move, plus 64 for the trailing reset and general slack.
+/**
+ * @brief Size of the scratch buffer a frame is assembled in.
+ *
+ * @param w Surface width in cells.
+ * @param h Surface height in cells.
+ * @return Bytes required for a worst-case full repaint.
+ *
+ * @warning This has to be a hard upper bound, not an estimate: present()
+ *          writes into the buffer without bounds checks, so under-sizing it is
+ *          a buffer overflow.
+ * @note Worst case for one cell is every escape firing at once: ~12 for a
+ *       cursor move, 19 for a foreground, 19 for a background and 1 for the
+ *       character, which is 51; 56 rounds up with room to spare. Per row adds
+ *       16 for a leading cursor move, plus 64 overall for the trailing reset
+ *       and general slack.
+ */
 static inline size_t screen_out_bytes(int w, int h) {
   return (size_t)w * (size_t)h * 56 + (size_t)h * 16 + 64;
 }
 
-// Total arena bytes screen_create() consumes: the Screen, all six planes, the
-// scratch buffer, and worst-case alignment padding on each allocation.
-// Size your arena with this.
+/**
+ * @brief Total arena bytes screen_create() will consume. Size your arena with
+ *        this.
+ *
+ * @param w Surface width in cells.
+ * @param h Surface height in cells.
+ * @return Bytes for the Screen struct, all six planes, the scratch buffer, and
+ *         worst-case alignment padding on each of the eight allocations.
+ *
+ * @note An upper bound, not the exact figure: real padding is usually smaller.
+ */
 static inline size_t screen_arena_bytes(int w, int h) {
   size_t n = (size_t)w * (size_t)h;
   return sizeof(Screen) + 2 * n * sizeof(char) + 4 * n * sizeof(Color) +
          screen_out_bytes(w, h) + 8 * ARENA_DEFAULT_ALIGN;
 }
 
-// The Screen and every plane come from `a`, so arena_destroy() reclaims the
-// whole thing at once and there is nothing to free individually. Returns NULL
-// if the arena cannot fit it, rewinding the arena to where it started so a
-// failed create leaves no partial allocation behind.
-//
-// The planes live as long as the screen does, so the arena must not be reset
-// while it is in use -- the swap planes in particular have to survive across
-// frames for the comparison to mean anything.
+/**
+ * @brief Allocate a Screen and all its planes from an arena.
+ *
+ * @param a Arena to allocate from. Must hold at least screen_arena_bytes(w, h)
+ *          free. Must outlive the Screen.
+ * @param w Surface width in cells. This is the size of your drawing surface,
+ *          not the terminal's -- present() clips to the smaller of the two.
+ * @param h Surface height in cells, same.
+ * @return The new Screen, or NULL if the arena cannot fit it. On failure the
+ *         arena is rewound to where it started, so a failed create leaves no
+ *         partial allocation behind.
+ *
+ * @note Everything comes from @p a, so arena_destroy() reclaims the whole
+ *       thing at once and there is nothing to free individually.
+ * @warning The arena must not be reset while the Screen is in use. The swap
+ *          planes in particular have to survive across frames for the
+ *          comparison to mean anything.
+ * @note Both sets of planes start as blank spaces with zeroed colours.
+ */
 static inline Screen *screen_create(Arena *a, int w, int h) {
   size_t mark = a->current;
   size_t n = (size_t)w * (size_t)h;
@@ -400,9 +682,19 @@ static inline Screen *screen_create(Arena *a, int w, int h) {
 
 // --- writes -----------------------------------------------------------------
 
-// Fill the whole surface with one character and colour. Because present()
-// swaps rather than copies, every frame starts here -- see the note on
-// screen_present() about the planes holding two-frames-ago content.
+/**
+ * @brief Fill the whole surface with one character and colour.
+ *
+ * @param s  Screen to clear.
+ * @param c  Character to write into every cell, usually ' '.
+ * @param fg Foreground for every cell, from ::RGB.
+ * @param bg Background for every cell, from ::BG, or ::BG_NONE for the
+ *           terminal's default.
+ *
+ * @note Because present() swaps rather than copies, **every frame must start
+ *       here**. The planes you draw into hold the contents of two frames ago,
+ *       so anything you do not overwrite is stale, not persistent.
+ */
 static inline void screen_clear(Screen *s, char c, Color fg, Color bg) {
   memset(s->characters, c, s->n);
   for (size_t i = 0; i < s->n; i++)
@@ -414,8 +706,22 @@ static inline void screen_clear(Screen *s, char c, Color fg, Color bg) {
       s->bg[i] = bg;
 }
 
-// Writing off the surface is ignored rather than treated as an error, so
-// callers can draw sprites that hang off the edge without clipping by hand.
+/**
+ * @brief Write one cell, character, foreground and background.
+ *
+ * @param s  Screen to draw into.
+ * @param x  Column, 0-based from the left. Out-of-range values are ignored.
+ * @param y  Row, 0-based from the top. Out-of-range values are ignored.
+ * @param c  Character to write. One byte -- no UTF-8; a multi-byte glyph would
+ *           need several cells and break the per-cell diff.
+ * @param fg Foreground colour, from ::RGB.
+ * @param bg Background colour, from ::BG, or ::BG_NONE for the default.
+ *
+ * @note Writing off the surface is ignored rather than treated as an error, so
+ *       callers can draw sprites that hang off the edge without clipping by
+ *       hand. Negative coordinates are caught by the same single comparison,
+ *       via an unsigned cast.
+ */
 static inline void screen_set_bg(Screen *s, int x, int y, char c, Color fg,
                                  Color bg) {
   // Casting to unsigned folds the negative check into the bounds check: -1
@@ -428,13 +734,38 @@ static inline void screen_set_bg(Screen *s, int x, int y, char c, Color fg,
   s->bg[i] = bg;
 }
 
-// One cell, leaving the background as the terminal's default.
+/**
+ * @brief Write one cell, leaving the background as the terminal's default.
+ *
+ * @param s  Screen to draw into.
+ * @param x  Column, 0-based. Out-of-range values are ignored.
+ * @param y  Row, 0-based. Out-of-range values are ignored.
+ * @param c  Character to write.
+ * @param fg Foreground colour, from ::RGB.
+ *
+ * @see screen_set_bg() to also set a background.
+ */
 static inline void screen_set(Screen *s, int x, int y, char c, Color fg) {
   screen_set_bg(s, x, y, c, fg, BG_NONE);
 }
 
-// Fill a w-by-h block. Clipped to the surface by clamping the loop bounds once
-// rather than testing every cell, unlike the single-cell writes above.
+/**
+ * @brief Fill a rectangular block with one character and colour.
+ *
+ * @param s  Screen to draw into.
+ * @param x  Left column of the rect, 0-based. May be negative.
+ * @param y  Top row of the rect, 0-based. May be negative.
+ * @param w  Width in cells, counted rightwards from @p x. Note this shadows
+ *           the meaning of `w` in screen_create() -- here it is the rect, not
+ *           the surface. Zero or negative draws nothing.
+ * @param h  Height in cells, counted downwards from @p y. Same.
+ * @param c  Character to write into every cell of the rect.
+ * @param fg Foreground colour, from ::RGB.
+ * @param bg Background colour, from ::BG, or ::BG_NONE.
+ *
+ * @note Clipped to the surface by clamping the loop bounds once, rather than
+ *       testing every cell as the single-cell writes do.
+ */
 static inline void screen_fill_rect(Screen *s, int x, int y, int w, int h,
                                     char c, Color fg, Color bg) {
   int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
@@ -450,7 +781,20 @@ static inline void screen_fill_rect(Screen *s, int x, int y, int w, int h,
   }
 }
 
-// Draw a NUL-terminated string left to right. Clipped at the surface edge.
+/**
+ * @brief Draw a NUL-terminated string left to right on one row.
+ *
+ * @param s   Screen to draw into.
+ * @param x   Column of the first character. May be negative; the visible tail
+ *            still lands correctly.
+ * @param y   Row to draw on. A row off the surface draws nothing.
+ * @param str String to draw, one byte per cell. Does not wrap at the right
+ *            edge -- it is clipped, not continued on the next row.
+ * @param fg  Foreground colour, from ::RGB. The background is left as the
+ *            terminal's default.
+ *
+ * @note No formatting. Build the string yourself (snprintf) and pass it here.
+ */
 static inline void screen_text(Screen *s, int x, int y, const char *str,
                                Color fg) {
   for (int i = 0; str[i]; i++)
@@ -462,18 +806,51 @@ static inline void screen_text(Screen *s, int x, int y, const char *str,
 // the terminal is showing. Out-of-bounds reads return a blank rather than
 // failing, so callers can probe freely.
 
+/**
+ * @brief Read back the character at one cell.
+ *
+ * @param s Screen to read from.
+ * @param x Column, 0-based.
+ * @param y Row, 0-based.
+ * @return The character in that cell, or ' ' if the coordinates are off the
+ *         surface -- out-of-bounds reads return a blank rather than failing,
+ *         so callers can probe freely.
+ *
+ * @note Reads the *front* planes: what is being drawn this frame, not what the
+ *       terminal is currently showing.
+ */
 static inline char screen_get(const Screen *s, int x, int y) {
   if ((unsigned)x >= (unsigned)s->w || (unsigned)y >= (unsigned)s->h)
     return ' ';
   return s->characters[(size_t)y * (size_t)s->w + (size_t)x];
 }
 
+/**
+ * @brief Read back the foreground colour at one cell.
+ *
+ * @param s Screen to read from.
+ * @param x Column, 0-based.
+ * @param y Row, 0-based.
+ * @return The packed foreground, or 0 (black) if the coordinates are off the
+ *         surface. Note 0 is also a legitimate colour, so this cannot be used
+ *         to detect out-of-bounds.
+ */
 static inline Color screen_get_fg(const Screen *s, int x, int y) {
   if ((unsigned)x >= (unsigned)s->w || (unsigned)y >= (unsigned)s->h)
     return 0;
   return s->fg[(size_t)y * (size_t)s->w + (size_t)x];
 }
 
+/**
+ * @brief Read back the background colour at one cell.
+ *
+ * @param s Screen to read from.
+ * @param x Column, 0-based.
+ * @param y Row, 0-based.
+ * @return The packed background, or ::BG_NONE if the coordinates are off the
+ *         surface. Test against ::BG_NONE, not 0, to tell "no background" from
+ *         a black one -- see ::COLOR_SET.
+ */
 static inline Color screen_get_bg(const Screen *s, int x, int y) {
   if ((unsigned)x >= (unsigned)s->w || (unsigned)y >= (unsigned)s->h)
     return BG_NONE;
@@ -486,8 +863,21 @@ static inline Color screen_get_bg(const Screen *s, int x, int y) {
 // bookkeeping. None bounds check: screen_out_bytes() sized the buffer for the
 // worst case precisely so this inner loop does not have to.
 
-// Append `v` in decimal. Digits come out backwards, hence the scratch reverse;
-// the do/while means 0 writes "0" rather than nothing.
+/**
+ * @brief Append @p v in decimal to the frame buffer.
+ *
+ * @param p Current write position. Must have room; not bounds checked.
+ * @param v Value to format. 0 writes "0" rather than nothing, thanks to the
+ *          do/while.
+ * @return The new write position, so escapes chain as p = f(p, ...) with no
+ *         length bookkeeping.
+ *
+ * @note Digits come out backwards from the division, hence the scratch buffer
+ *       and reverse copy.
+ * @note Internal to present(). Like the other appenders it does not bounds
+ *       check: screen_out_bytes() sized the buffer for the worst case
+ *       precisely so this inner loop does not have to.
+ */
 static inline char *screen_u32(char *p, unsigned v) {
   char tmp[10];
   int n = 0;
@@ -500,16 +890,36 @@ static inline char *screen_u32(char *p, unsigned v) {
   return p;
 }
 
-// Append a NUL-terminated string, without the terminator.
+/**
+ * @brief Append a NUL-terminated string to the frame buffer, without its
+ *        terminator.
+ *
+ * @param p Current write position. Must have room; not bounds checked.
+ * @param s String to append.
+ * @return The new write position.
+ *
+ * @note Internal to present().
+ */
 static inline char *screen_str(char *p, const char *s) {
   while (*s)
     *p++ = *s++;
   return p;
 }
 
-// Append a 24-bit colour escape. `intro` selects which one -- "\x1b[38;2;" for
-// foreground, "\x1b[48;2;" for background -- and this completes it with the
-// three channel values and the terminating 'm'.
+/**
+ * @brief Append a 24-bit colour escape to the frame buffer.
+ *
+ * @param p     Current write position. Must have room; not bounds checked.
+ * @param intro Which escape to open: "\x1b[38;2;" for a foreground,
+ *              "\x1b[48;2;" for a background. The 38/48 codes take a
+ *              colour-space selector, and the "2" means direct RGB as opposed
+ *              to "5", which would mean a 256-colour palette index.
+ * @param c     Colour to emit. Only the low 24 bits are read, so the
+ *              ::COLOR_SET flag is harmless here.
+ * @return The new write position, past the terminating 'm'.
+ *
+ * @note Internal to present().
+ */
 static inline char *screen_emit_color(char *p, const char *intro, Color c) {
   p = screen_str(p, intro);
   p = screen_u32(p, COLOR_R(c));
@@ -521,9 +931,14 @@ static inline char *screen_emit_color(char *p, const char *intro, Color c) {
   return p;
 }
 
-// Exchange the front and swap planes. Called at the end of present(), once the
-// front planes have been sent to the terminal and therefore describe what it is
-// now showing.
+/**
+ * @brief Exchange the front and swap planes -- a pointer exchange, not a copy.
+ *
+ * @param s Screen whose planes to swap.
+ *
+ * @note Called at the end of present(), once the front planes have been sent
+ *       to the terminal and therefore describe what it is now showing.
+ */
 static inline void screen_swap(Screen *s) {
   char *c = s->characters;
   s->characters = s->swap_characters;
@@ -538,25 +953,35 @@ static inline void screen_swap(Screen *s) {
   s->swap_bg = b;
 }
 
-// Draw the frame and swap the buffers.
-//
-// IMPORTANT: because this swaps rather than copies, the planes you draw into
-// next frame hold the contents of *two* frames ago, not the frame you just
-// drew. Redraw the full frame each time -- screen_clear() then draw -- exactly
-// as you would with any double-buffered renderer. Whatever you do not overwrite
-// is stale, not persistent.
-//
-// Everything here exists to avoid flicker or wasted bytes:
-//   - One write() per frame. Drawing incrementally (a printf per cell) lets the
-//     terminal present half-finished frames, which is what reads as flicker.
-//   - No screen clear. Clearing then redrawing shows a blank screen for the
-//     duration of the repaint; changed cells are overwritten in place instead.
-//   - Only cells differing from the swap planes are emitted, coalesced into
-//     spans, so a still screen costs zero bytes and zero syscalls.
-//   - Clipping to the terminal viewport. Addressing a row past the bottom
-//     clamps to the last row, so off-screen rows would otherwise pile onto the
-//     bottom line every frame.
-//   - Colour escapes only on change, since they are ~20x the size of a cell.
+/**
+ * @brief Draw the frame to the terminal and swap the buffers.
+ *
+ * @param s Screen to present. NULL, or one whose planes are NULL, returns
+ *          silently rather than crashing.
+ *
+ * @warning Because this **swaps rather than copies**, the planes you draw into
+ *          next frame hold the contents of *two* frames ago, not the frame you
+ *          just drew. Redraw the full frame each time -- screen_clear() then
+ *          draw -- exactly as with any double-buffered renderer. Whatever you
+ *          do not overwrite is stale, not persistent.
+ *
+ * Everything here exists to avoid flicker or wasted bytes:
+ * - One write() per frame. Drawing incrementally (a printf per cell) lets the
+ *   terminal present half-finished frames, which is what reads as flicker.
+ * - No screen clear. Clearing then redrawing shows a blank screen for the
+ *   duration of the repaint; changed cells are overwritten in place instead.
+ * - Only cells differing from the swap planes are emitted, coalesced into
+ *   spans (see ::SCREEN_SPAN_GAP), so a still screen costs zero bytes and zero
+ *   syscalls.
+ * - Clipping to the terminal viewport. Addressing a row past the bottom clamps
+ *   to the last row, so off-screen rows would otherwise pile onto the bottom
+ *   line every frame.
+ * - Colour escapes only on change, since they are ~20x the size of a cell.
+ *
+ * @note A resize forces a full repaint, because the terminal reflows or
+ *       discards content on its own and the swap planes stop describing it.
+ * @note If the size query fails it clips nothing rather than drawing nothing.
+ */
 static inline void screen_present(Screen *s) {
   if (!s || !s->characters)
     return;
@@ -676,8 +1101,15 @@ static inline void screen_present(Screen *s) {
   s->prev_valid = 1;
 }
 
-// Force the next present to repaint every cell, e.g. after something else has
-// written to the terminal behind the renderer's back.
+/**
+ * @brief Force the next present to repaint every cell.
+ *
+ * @param s Screen to invalidate. Must not be NULL.
+ *
+ * @note Use this after something else has written to the terminal behind the
+ *       renderer's back, which leaves the swap planes describing a screen
+ *       state that is no longer true.
+ */
 static inline void screen_invalidate(Screen *s) { s->prev_valid = 0; }
 
 #endif
