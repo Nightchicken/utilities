@@ -2,16 +2,35 @@
 #define TERMINAL_H
 #include "arena.h"
 #include "vec.h"
-#include <bits/pthreadtypes.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef RGB // wingdi.h's; this header defines its own below
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#ifndef DISABLE_NEWLINE_AUTO_RETURN
+#define DISABLE_NEWLINE_AUTO_RETURN 0x0008
+#endif
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#else
 #include <sys/ioctl.h>
 #include <termios.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 /**
  * @file terminal.h
@@ -74,9 +93,12 @@
  * @warning Defines a type named `Screen`, which collides with the unrelated
  *          `Screen` in raster.h. Only one of the two headers can be included
  *          in a given translation unit.
- * @note POSIX-only (termios, ioctl, clock_nanosleep). Needs `-std=gnu11` or
- *       `-D_POSIX_C_SOURCE=200809L`; strict `-std=c11` hides CLOCK_MONOTONIC
- *       and TIMER_ABSTIME and fails to compile.
+ * @note POSIX (termios, ioctl, clock_nanosleep) and Windows 10+ (console VT
+ *       mode, QueryPerformanceCounter, a high-resolution waitable timer). On
+ *       POSIX it needs `-std=gnu11` or `-D_POSIX_C_SOURCE=200809L`; strict
+ *       `-std=c11` hides CLOCK_MONOTONIC and TIMER_ABSTIME. On Windows use
+ *       Windows Terminal or a Windows 10+ console; the legacy console has no
+ *       VT support and term_init() cannot fix that.
  * @note Cells are single bytes, so the surface is ASCII only -- a multi-byte
  *       UTF-8 glyph would span several cells and break the per-cell diff.
  */
@@ -111,7 +133,14 @@
 /** @brief The terminal settings saved by term_init(), for term_restore() to
  *         put back. File-scope, so only one terminal can be managed at a
  *         time -- which is the only sane reading of "the" terminal anyway. */
+#ifdef _WIN32
+static DWORD term_saved_in, term_saved_out;
+#else
 static struct termios term_saved;
+#endif
+/** @brief How long term_read_keys() waits for a key, in tenths of a second.
+ *         Set with term_set_read_timeout(). */
+static int term_read_timeout = 1;
 /** @brief Whether ::term_saved actually holds settings worth restoring. Stays
  *         0 when stdin is not a terminal (piped input, a cron job), because
  *         restoring garbage termios onto whatever stdin really is would be
@@ -133,12 +162,26 @@ static int term_saved_valid = 0;
  * @note Queries stdout, not stdin, so it still works with stdin redirected.
  */
 static inline int term_size(int *cols, int *rows) {
+#ifdef _WIN32
+  // The visible window, not the buffer: the buffer can be thousands of rows.
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info))
+    return -1;
+  int c = info.srWindow.Right - info.srWindow.Left + 1;
+  int r = info.srWindow.Bottom - info.srWindow.Top + 1;
+  if (c <= 0 || r <= 0)
+    return -1;
+  *cols = c;
+  *rows = r;
+  return 0;
+#else
   struct winsize ws;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
     return -1;
   *cols = ws.ws_col;
   *rows = ws.ws_row;
   return 0;
+#endif
 }
 
 /**
@@ -158,12 +201,23 @@ static inline int term_size(int *cols, int *rows) {
  */
 static inline void term_write_n(const char *s, size_t len) {
   size_t off = 0;
+#ifdef _WIN32
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  while (off < len) {
+    DWORD n = 0;
+    DWORD want = len - off > 0x7fffffff ? 0x7fffffff : (DWORD)(len - off);
+    if (!WriteFile(out, s + off, want, &n, NULL) || n == 0)
+      break;
+    off += n;
+  }
+#else
   while (off < len) {
     ssize_t n = write(STDOUT_FILENO, s + off, len - off);
     if (n <= 0)
       break;
     off += (size_t)n;
   }
+#endif
 }
 
 /**
@@ -201,6 +255,23 @@ static inline void term_write(const char *s) { term_write_n(s, strlen(s)); }
  * @see term_restore()
  */
 static inline void term_init(void) {
+#ifdef _WIN32
+  // The console equivalent of raw mode: no line buffering, no echo, and
+  // Ctrl-C as a byte (PROCESSED_INPUT off). Quick-edit is off too, or a stray
+  // click starts a text selection that freezes all output until Esc.
+  HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (GetConsoleMode(in, &term_saved_in) && GetConsoleMode(out, &term_saved_out)) {
+    term_saved_valid = 1;
+    DWORD im = term_saved_in & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                        ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
+    SetConsoleMode(in, im | ENABLE_EXTENDED_FLAGS);
+    // VT processing is what makes the escapes below mean anything.
+    // DISABLE_NEWLINE_AUTO_RETURN is the console's version of clearing OPOST.
+    SetConsoleMode(out, term_saved_out | ENABLE_PROCESSED_OUTPUT |
+                            ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+  }
+  FlushConsoleInputBuffer(in);
+#else
   // Only mark the saved copy valid if the query worked. If stdin is not a
   // terminal (piped input, a cron job) tcgetattr fails, and restoring garbage
   // termios onto whatever stdin really is would be worse than not restoring.
@@ -242,12 +313,13 @@ static inline void term_init(void) {
   // loop can re-check a `running` flag between calls instead of hanging on exit.
   // VMIN=0/VTIME=0 would busy-poll; VMIN=1 would block until a key is pressed.
   raw.c_cc[VMIN] = 0;
-  raw.c_cc[VTIME] = 1;
+  raw.c_cc[VTIME] = (cc_t)term_read_timeout;
 
   // TCSAFLUSH applies the change once pending output has drained and discards
   // unread input, so keys typed before the game started are not delivered as
   // commands.
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+#endif
 
   // The alternate screen is a second, scrollback-less buffer. Drawing there
   // means quitting can restore the user's shell history untouched.
@@ -273,9 +345,39 @@ static inline void term_restore(void) {
   term_write(TERM_SHOW_CUR);
   term_write(TERM_ALT_OFF);
   if (term_saved_valid) {
+#ifdef _WIN32
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), term_saved_in | ENABLE_EXTENDED_FLAGS);
+    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), term_saved_out);
+#else
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &term_saved);
+#endif
     term_saved_valid = 0; // guard against a double restore
   }
+}
+
+/**
+ * @brief Set how long term_read_keys() waits when no key is queued.
+ *
+ * @param tenths Tenths of a second, 0..255. 0 makes term_read_keys() return
+ *               immediately, which is what a loop paced by ::FrameClock wants;
+ *               the default of 1 suits a loop that has no other clock.
+ *
+ * @note Safe before or after term_init(). On POSIX this is VTIME: before
+ *       term_init() it is recorded for term_init() to apply, after it the
+ *       live terminal is updated.
+ */
+static inline void term_set_read_timeout(int tenths) {
+  term_read_timeout = tenths < 0 ? 0 : tenths > 255 ? 255 : tenths;
+#ifndef _WIN32
+  // Before term_init() this only records the value: changing the live
+  // terminal now would also change the settings term_restore() puts back.
+  struct termios t;
+  if (!term_saved_valid || tcgetattr(STDIN_FILENO, &t) != 0)
+    return;
+  t.c_cc[VMIN] = 0;
+  t.c_cc[VTIME] = (cc_t)term_read_timeout;
+  tcsetattr(STDIN_FILENO, TCSANOW, &t);
+#endif
 }
 /**
  * @brief Drain every key byte already queued.
@@ -288,16 +390,113 @@ static inline void term_restore(void) {
  * @return Number of bytes read, 0 if nothing was pressed. Never negative:
  *         read errors are reported as 0.
  *
- * @note With the VMIN=0/VTIME=1 raw mode set by term_init() this blocks for at
- *       most ~100ms, so 0 genuinely means "nothing is being pressed" rather
- *       than "not yet".
+ * @note Blocks for at most the term_set_read_timeout() value (~100ms by
+ *       default), so 0 genuinely means "nothing is being pressed" rather than
+ *       "not yet". With a timeout of 0 it never blocks.
+ * @note On Windows, console key events are translated to the bytes a POSIX
+ *       terminal would send (see term_key_bytes()), so one parser serves both.
  * @note Terminals have no key-up event. A held key shows up as OS auto-repeat,
  *       i.e. repeated bytes arriving on successive calls -- so you cannot ask
  *       whether a key is currently down, only whether it repeated recently.
  */
+#ifdef _WIN32
+/**
+ * @brief The bytes a POSIX terminal sends for one Windows key-down event.
+ *
+ * @param k   The event. Keys with a character (letters, Enter, Esc, Tab,
+ *            Backspace, Ctrl-letter) give that byte; arrows and the editing
+ *            keys give their xterm escape sequences.
+ * @param out Room for at least 4 bytes.
+ * @return Bytes written, 0 for keys with no POSIX equivalent (Shift alone,
+ *         function keys).
+ *
+ * @note Internal to term_read_keys(). Mapping here rather than relying on
+ *       ENABLE_VIRTUAL_TERMINAL_INPUT keeps it working on consoles without VT
+ *       input, and gives Backspace the 127 POSIX terminals send.
+ */
+static inline int term_key_bytes(const KEY_EVENT_RECORD *k, char *out) {
+  const char *seq = NULL;
+  switch (k->wVirtualKeyCode) {
+  case VK_UP: seq = "\x1b[A"; break;
+  case VK_DOWN: seq = "\x1b[B"; break;
+  case VK_RIGHT: seq = "\x1b[C"; break;
+  case VK_LEFT: seq = "\x1b[D"; break;
+  case VK_HOME: seq = "\x1b[H"; break;
+  case VK_END: seq = "\x1b[F"; break;
+  case VK_DELETE: seq = "\x1b[3~"; break;
+  case VK_BACK: out[0] = 127; return 1;
+  }
+  if (seq) {
+    int n = (int)strlen(seq);
+    memcpy(out, seq, (size_t)n);
+    return n;
+  }
+  if (k->uChar.AsciiChar) {
+    out[0] = k->uChar.AsciiChar;
+    return 1;
+  }
+  return 0;
+}
+#endif
+
 static inline int term_read_keys(char *buf, size_t cap) {
+#ifdef _WIN32
+  HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+  DWORD type = GetFileType(in);
+  if (type != FILE_TYPE_CHAR) {
+    // Redirected stdin is a pipe or file, which holds plain bytes already.
+    // Peek a pipe first: ReadFile on an empty one blocks until it fills.
+    DWORD avail = 0, n = 0;
+    if (type == FILE_TYPE_PIPE) {
+      if (!PeekNamedPipe(in, NULL, 0, NULL, &avail, NULL))
+        return 0;
+      if (avail == 0) {
+        Sleep((DWORD)term_read_timeout * 100);
+        return 0;
+      }
+      if (avail < cap)
+        cap = avail;
+    }
+    if (!ReadFile(in, buf, (DWORD)cap, &n, NULL))
+      return 0;
+    return (int)n;
+  }
+  DWORD pending = 0;
+  if (!GetNumberOfConsoleInputEvents(in, &pending))
+    return 0;
+  if (pending == 0) {
+    if (WaitForSingleObject(in, (DWORD)term_read_timeout * 100) != WAIT_OBJECT_0)
+      return 0;
+  }
+  // Peek, then remove only the events that fit, so a key that would
+  // overflow buf stays queued for the next call like the POSIX read().
+  INPUT_RECORD rec[64];
+  DWORD got = 0, used = 0;
+  if (!PeekConsoleInputA(in, rec, 64, &got))
+    return 0;
+  size_t n = 0;
+  for (; used < got; used++) {
+    if (rec[used].EventType != KEY_EVENT || !rec[used].Event.KeyEvent.bKeyDown)
+      continue;
+    char bytes[8];
+    int len = term_key_bytes(&rec[used].Event.KeyEvent, bytes);
+    WORD reps = rec[used].Event.KeyEvent.wRepeatCount ? rec[used].Event.KeyEvent.wRepeatCount : 1;
+    if (n + (size_t)len * reps > cap)
+      break;
+    for (WORD r = 0; r < reps; r++) {
+      memcpy(buf + n, bytes, (size_t)len);
+      n += (size_t)len;
+    }
+  }
+  if (used > 0) {
+    DWORD dropped = 0;
+    ReadConsoleInputA(in, rec, used, &dropped);
+  }
+  return (int)n;
+#else
   ssize_t n = read(STDIN_FILENO, buf, cap);
   return n > 0 ? (int)n : 0;
+#endif
 }
 
 /**
@@ -313,13 +512,69 @@ static inline int term_read_keys(char *buf, size_t cap) {
  * 0.016ms of jitter at 60fps with 1-9ms of deliberately varied render cost.
  *
  * @var FrameClock::next
- *   Absolute CLOCK_MONOTONIC time the next frame should begin. Stepped by
+ *   Absolute term_now() time the next frame should begin. Stepped by
  *   exactly @ref FrameClock::frame_ns each time, never recomputed from "now",
  *   so rounding errors cannot accumulate into drift.
  * @var FrameClock::frame_ns
  *   Nanoseconds per frame -- the amount `next` steps by. Set from the fps
  *   passed to frame_clock_init().
  */
+/**
+ * @brief Read the monotonic clock.
+ *
+ * @param t Out-parameter for the current time. Only differences between two
+ *          readings mean anything; the epoch is unspecified.
+ *
+ * @note CLOCK_MONOTONIC on POSIX, QueryPerformanceCounter on Windows. Use it
+ *       for frame timing of your own (an FPS counter, a delta time).
+ */
+static inline void term_now(struct timespec *t) {
+#ifdef _WIN32
+  static LARGE_INTEGER freq;
+  if (!freq.QuadPart)
+    QueryPerformanceFrequency(&freq);
+  LARGE_INTEGER c;
+  QueryPerformanceCounter(&c);
+  t->tv_sec = (time_t)(c.QuadPart / freq.QuadPart);
+  t->tv_nsec = (long)((c.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
+#else
+  clock_gettime(CLOCK_MONOTONIC, t);
+#endif
+}
+
+/**
+ * @brief Sleep until an absolute time read from term_now().
+ *
+ * @param until Deadline. One already in the past returns at once.
+ *
+ * @note Windows has no absolute sleep, so it sleeps for the remaining time on
+ *       a high-resolution waitable timer (Windows 10 1803+). Older systems
+ *       fall back to Sleep(), which rounds to the ~15ms scheduler tick.
+ */
+static inline void term_sleep_until(const struct timespec *until) {
+#ifdef _WIN32
+  struct timespec now;
+  term_now(&now);
+  long long ns = (long long)(until->tv_sec - now.tv_sec) * 1000000000LL + (until->tv_nsec - now.tv_nsec);
+  if (ns <= 0)
+    return;
+  static HANDLE timer;
+  static int tried;
+  if (!tried) {
+    tried = 1;
+    timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  }
+  LARGE_INTEGER due;
+  due.QuadPart = -(ns / 100); // negative means relative, in 100ns units
+  if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+    WaitForSingleObject(timer, INFINITE);
+  else
+    Sleep((DWORD)(ns / 1000000));
+#else
+  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, until, NULL);
+#endif
+}
+
 typedef struct FrameClock {
   struct timespec next; // absolute time the next frame should begin
   long frame_ns;        // nanoseconds per frame, the amount `next` steps by
@@ -334,14 +589,14 @@ typedef struct FrameClock {
  *            rather than erroring. Note the period is truncated to whole
  *            nanoseconds, so odd rates are approximate.
  *
- * @note Uses CLOCK_MONOTONIC, not CLOCK_REALTIME: it cannot jump backwards
+ * @note Uses the monotonic clock (term_now()), not wall time: it cannot jump backwards
  *       when NTP adjusts the wall clock or the user changes timezone.
  */
 static inline void frame_clock_init(FrameClock *fc, int fps) {
   // CLOCK_MONOTONIC, not CLOCK_REALTIME: it cannot jump backwards when NTP
   // adjusts the wall clock or the user changes timezone mid-game.
   fc->frame_ns = fps > 0 ? 1000000000L / fps : 16666667L;
-  clock_gettime(CLOCK_MONOTONIC, &fc->next);
+  term_now(&fc->next);
 }
 
 /**
@@ -376,7 +631,7 @@ static inline int frame_wait(FrameClock *fc) {
   // Sleeping is pointless, and leaving the stale deadline in place would make
   // the next several frames fire back-to-back trying to "catch up" -- so rebase
   // to now and take the hit once.
-  clock_gettime(CLOCK_MONOTONIC, &now);
+  term_now(&now);
   if (now.tv_sec > fc->next.tv_sec ||
       (now.tv_sec == fc->next.tv_sec && now.tv_nsec > fc->next.tv_nsec)) {
     fc->next = now;
@@ -386,7 +641,7 @@ static inline int frame_wait(FrameClock *fc) {
   // TIMER_ABSTIME sleeps *until* a point in time rather than *for* a duration.
   // That closes the race in the relative version, where the time spent
   // computing the remaining delay is itself not counted.
-  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &fc->next, NULL);
+  term_sleep_until(&fc->next);
   return 1;
 }
 // ---------------------------------------------------------------------------
@@ -509,12 +764,25 @@ typedef uint32_t Color;
  * interleaved fields.
  *
  * @var Screen::w
- *   Surface width in cells, fixed at creation and independent of the terminal
- *   window -- present() clips to whichever is smaller rather than reflowing.
+ *   Surface width in cells. Independent of the terminal window -- present()
+ *   clips to whichever is smaller rather than reflowing -- but not fixed:
+ *   screen_resize() changes it, and screen_sync_size() tracks the window.
  * @var Screen::h
  *   Surface height in cells, same.
  * @var Screen::n
  *   w * h, cached because every plane is indexed y * w + x.
+ * @var Screen::cap_n
+ *   Cells the planes were actually allocated for. Always >= @ref Screen::n; a
+ *   resize that still fits under this reuses the planes instead of taking
+ *   memory from the arena again.
+ * @var Screen::arena
+ *   Arena the planes came from, kept so a resize past @ref Screen::cap_n can
+ *   allocate bigger ones. NULL makes the surface fixed-capacity.
+ * @var Screen::mark
+ *   Arena offset just past the Screen struct, i.e. where the planes begin.
+ *   A grow rewinds here and reallocates, which is only sound because nothing
+ *   else may be allocated from the arena after the Screen -- see
+ *   screen_resize().
  * @var Screen::characters
  *   Front plane: the glyph in each cell. This is what you draw into.
  * @var Screen::fg
@@ -547,11 +815,12 @@ typedef uint32_t Color;
  *          two headers cannot be included in the same translation unit.
  */
 typedef struct Screen {
-  // Surface size in cells. This is the size of the drawing surface, fixed at
-  // creation, and is independent of the terminal window -- present() clips to
-  // whichever is smaller rather than reflowing.
+  // Surface size in cells. This is the size of the drawing surface, and is
+  // independent of the terminal window -- present() clips to whichever is
+  // smaller rather than reflowing. Changed only through screen_resize().
   int w, h;
-  size_t n; // w * h, cached because every plane is indexed y * w + x
+  size_t n;     // w * h, cached because every plane is indexed y * w + x
+  size_t cap_n; // cells the planes hold; a resize within this reuses them
 
   // Front planes: what you draw into. Three parallel arrays rather than one
   // array of cells, so present()'s comparison walks each contiguously.
@@ -575,6 +844,11 @@ typedef struct Screen {
                             // describe nothing and the next frame is a full
                             // repaint rather than a diff
   int last_cols, last_rows; // viewport at last present, to detect a resize
+
+  // Where the planes came from, so screen_resize() can grow them. NULL means
+  // fixed capacity: a resize past cap_n fails instead of reallocating.
+  Arena *arena;
+  size_t mark; // arena offset of the first plane, rewound to on a grow
 } Screen;
 
 /**
@@ -598,6 +872,24 @@ static inline size_t screen_out_bytes(int w, int h) {
 }
 
 /**
+ * @brief Arena bytes the six planes and the scratch buffer take for a given
+ *        surface size, excluding the Screen struct itself.
+ *
+ * @param w Surface width in cells.
+ * @param h Surface height in cells.
+ * @return Bytes for the planes, the scratch buffer, and worst-case alignment
+ *         padding on each of the seven allocations.
+ *
+ * @note This is what screen_resize() has to fit when it grows, since a grow
+ *       rewinds to Screen::mark and reallocates only the planes.
+ */
+static inline size_t screen_plane_bytes(int w, int h) {
+  size_t n = (size_t)w * (size_t)h;
+  return 2 * n * sizeof(char) + 4 * n * sizeof(Color) + screen_out_bytes(w, h) +
+         7 * ARENA_DEFAULT_ALIGN;
+}
+
+/**
  * @brief Total arena bytes screen_create() will consume. Size your arena with
  *        this.
  *
@@ -607,11 +899,147 @@ static inline size_t screen_out_bytes(int w, int h) {
  *         worst-case alignment padding on each of the eight allocations.
  *
  * @note An upper bound, not the exact figure: real padding is usually smaller.
+ * @note This covers a surface of exactly w by h. A surface that follows the
+ *       terminal window needs headroom on top: screen_resize() can only grow
+ *       into arena space that is still free, so size the arena for the largest
+ *       window you want to support rather than the one you started in.
  */
 static inline size_t screen_arena_bytes(int w, int h) {
-  size_t n = (size_t)w * (size_t)h;
-  return sizeof(Screen) + 2 * n * sizeof(char) + 4 * n * sizeof(Color) +
-         screen_out_bytes(w, h) + 8 * ARENA_DEFAULT_ALIGN;
+  return sizeof(Screen) + ARENA_DEFAULT_ALIGN + screen_plane_bytes(w, h);
+}
+
+/**
+ * @brief Extra cells screen_resize() asks for when it has to grow the planes.
+ *
+ * Dragging a window edge produces a burst of sizes, each one cell bigger than
+ * the last. Growing by exactly what was asked for would rewind and reallocate
+ * on every one of them, and each reallocation permanently consumes the slack
+ * left over from the previous. Overshooting means a drag usually lands inside
+ * the capacity already allocated and costs nothing.
+ */
+#define SCREEN_GROW_SLACK 16
+
+/**
+ * @brief Blank both sets of planes over the current surface.
+ *
+ * @param s Screen whose planes to reset. Only the first Screen::n cells are
+ *          touched; capacity beyond that is never read.
+ *
+ * @note Used by screen_create_cap() and screen_resize(). After a resize the
+ *       old contents are meaningless anyway -- the stride changed, so the same
+ *       bytes now describe different cells.
+ */
+static inline void screen_blank_planes(Screen *s) {
+  memset(s->characters, ' ', s->n);
+  memset(s->swap_characters, ' ', s->n);
+  memset(s->fg, 0, s->n * sizeof(Color));
+  memset(s->swap_fg, 0, s->n * sizeof(Color));
+  memset(s->bg, 0, s->n * sizeof(Color));
+  memset(s->swap_bg, 0, s->n * sizeof(Color));
+}
+
+/**
+ * @brief Allocate the six planes and the scratch buffer, and point the Screen
+ *        at them.
+ *
+ * @param s      Screen to fill in. Its w/h/n are not touched -- the caller
+ *               sets the surface size, this only provides the room.
+ * @param a      Arena to allocate from.
+ * @param cap_w  Width in cells to allocate for.
+ * @param cap_h  Height in cells to allocate for.
+ * @return 1 on success, 0 if any allocation did not fit. On failure the
+ *         Screen's pointers are left as they were, so the caller decides
+ *         whether to rewind.
+ *
+ * @note Shared by screen_create_cap() and screen_resize(), which is the point:
+ *       the two have to lay the planes out identically for a grow to be a
+ *       rewind-and-repeat of the original allocation.
+ */
+static inline int screen_alloc_planes(Screen *s, Arena *a, int cap_w,
+                                      int cap_h) {
+  size_t cn = (size_t)cap_w * (size_t)cap_h;
+  size_t cap = screen_out_bytes(cap_w, cap_h);
+
+  char *ch = (char *)arena_alloc(a, cn);
+  char *sch = (char *)arena_alloc(a, cn);
+  Color *fg = (Color *)arena_alloc(a, cn * sizeof(Color));
+  Color *sfg = (Color *)arena_alloc(a, cn * sizeof(Color));
+  Color *bg = (Color *)arena_alloc(a, cn * sizeof(Color));
+  Color *sbg = (Color *)arena_alloc(a, cn * sizeof(Color));
+  char *out = (char *)arena_alloc(a, cap);
+
+  if (!ch || !sch || !fg || !sfg || !bg || !sbg || !out)
+    return 0;
+
+  s->characters = ch;
+  s->fg = fg;
+  s->bg = bg;
+  s->swap_characters = sch;
+  s->swap_fg = sfg;
+  s->swap_bg = sbg;
+  s->out = out;
+  s->out_cap = cap;
+  s->cap_n = cn;
+  return 1;
+}
+
+/**
+ * @brief Allocate a Screen whose planes are bigger than its starting surface.
+ *
+ * @param a     Arena to allocate from. Must hold at least
+ *              screen_arena_bytes(cap_w, cap_h) free, and must outlive the
+ *              Screen.
+ * @param w     Starting surface width in cells.
+ * @param h     Starting surface height in cells.
+ * @param cap_w Width to allocate planes for. Clamped up to @p w.
+ * @param cap_h Height to allocate planes for. Clamped up to @p h.
+ * @return The new Screen, or NULL if the arena cannot fit it. On failure the
+ *         arena is rewound to where it started.
+ *
+ * @note The capacity is a floor on free resizing, not a ceiling on size:
+ *       screen_resize() still grows past it while the arena has room. Its
+ *       value is avoiding that reallocation for sizes you expect.
+ */
+static inline Screen *screen_create_cap(Arena *a, int w, int h, int cap_w,
+                                        int cap_h) {
+  if (w < 1)
+    w = 1;
+  if (h < 1)
+    h = 1;
+  if (cap_w < w)
+    cap_w = w;
+  if (cap_h < h)
+    cap_h = h;
+
+  size_t start = a->current;
+  Screen *s = (Screen *)arena_alloc(a, sizeof(Screen));
+  if (!s) {
+    a->current = start;
+    return NULL;
+  }
+
+  memset(s, 0, sizeof(*s));
+  // Recorded before the planes, so a grow can rewind to exactly here and lay
+  // them out again from the same offset.
+  s->mark = a->current;
+  if (!screen_alloc_planes(s, a, cap_w, cap_h)) {
+    a->current = start;
+    return NULL;
+  }
+
+  s->arena = a;
+  s->w = w;
+  s->h = h;
+  s->n = (size_t)w * (size_t)h;
+  s->prev_valid = 0;
+  s->last_cols = -1;
+  s->last_rows = -1;
+
+  // Both sets start blank. The first present is a full repaint and never reads
+  // the swap planes, but leaving them uninitialised would make any future
+  // change to that logic read indeterminate memory.
+  screen_blank_planes(s);
+  return s;
 }
 
 /**
@@ -634,50 +1062,109 @@ static inline size_t screen_arena_bytes(int w, int h) {
  * @note Both sets of planes start as blank spaces with zeroed colours.
  */
 static inline Screen *screen_create(Arena *a, int w, int h) {
-  size_t mark = a->current;
+  return screen_create_cap(a, w, h, w, h);
+}
+
+/**
+ * @brief Change the surface size, reusing or regrowing the planes.
+ *
+ * Growing past the allocated capacity rewinds the arena to Screen::mark -- the
+ * offset just past the Screen struct -- and allocates bigger planes there.
+ *
+ * @param s Screen to resize. Must not be NULL.
+ * @param w New surface width in cells. Values below 1 are clamped to 1.
+ * @param h New surface height in cells, same.
+ * @return 1 on success, including the no-op case where the size is unchanged.
+ *         0 if the planes would have to grow and cannot: either the Screen was
+ *         created with no arena, or the arena has no room. The surface is left
+ *         untouched and still usable in that case.
+ *
+ * @warning The rewind is only sound because the planes are the last thing the
+ *          Screen allocated. **Nothing allocated from the same arena after
+ *          screen_create() may still be live when this grows**, or it is
+ *          handed out twice. Give the Screen its own arena, or allocate
+ *          everything else before it.
+ * @note The contents are discarded, not rescaled: both plane sets come back
+ *       blank and the next present is a full repaint. Callers redraw every
+ *       frame anyway.
+ * @note A shrink clears the terminal, since the rows and columns dropped off
+ *       the surface would otherwise keep whatever was last drawn there.
+ */
+static inline int screen_resize(Screen *s, int w, int h) {
+  if (!s)
+    return 0;
+  if (w < 1)
+    w = 1;
+  if (h < 1)
+    h = 1;
+  if (w == s->w && h == s->h)
+    return 1;
+
   size_t n = (size_t)w * (size_t)h;
-  size_t cap = screen_out_bytes(w, h);
+  if (n > s->cap_n || screen_out_bytes(w, h) > s->out_cap) {
+    Arena *a = s->arena;
+    if (!a)
+      return 0;
 
-  Screen *s = (Screen *)arena_alloc(a, sizeof(Screen));
-  char *ch = (char *)arena_alloc(a, n);
-  char *sch = (char *)arena_alloc(a, n);
-  Color *fg = (Color *)arena_alloc(a, n * sizeof(Color));
-  Color *sfg = (Color *)arena_alloc(a, n * sizeof(Color));
-  Color *bg = (Color *)arena_alloc(a, n * sizeof(Color));
-  Color *sbg = (Color *)arena_alloc(a, n * sizeof(Color));
-  char *out = (char *)arena_alloc(a, cap);
+    // Check the fit before rewinding, not after: the rewind frees the planes
+    // the Screen is still pointing at, so a reallocation that failed
+    // afterwards would leave it pointing into space the arena has handed back.
+    size_t room = a->capacity - s->mark;
+    int gw = w + SCREEN_GROW_SLACK, gh = h + SCREEN_GROW_SLACK;
+    if (screen_plane_bytes(gw, gh) > room) {
+      gw = w;
+      gh = h;
+    }
+    if (screen_plane_bytes(gw, gh) > room)
+      return 0;
 
-  if (!s || !ch || !sch || !fg || !sfg || !bg || !sbg || !out) {
-    a->current = mark;
-    return NULL;
+    a->current = s->mark;
+    if (!screen_alloc_planes(s, a, gw, gh))
+      return 0; // unreachable: the fit was just checked against the same bound
   }
 
-  memset(s, 0, sizeof(*s));
+  if (w < s->w || h < s->h)
+    term_write(TERM_CLEAR);
+
   s->w = w;
   s->h = h;
   s->n = n;
-  s->characters = ch;
-  s->fg = fg;
-  s->bg = bg;
-  s->swap_characters = sch;
-  s->swap_fg = sfg;
-  s->swap_bg = sbg;
-  s->out = out;
-  s->out_cap = cap;
+  screen_blank_planes(s);
+
+  // The swap planes no longer describe the terminal, so the next present must
+  // repaint rather than diff.
   s->prev_valid = 0;
   s->last_cols = -1;
   s->last_rows = -1;
+  return 1;
+}
 
-  // Both sets start blank. The first present is a full repaint and never reads
-  // the swap planes, but leaving them uninitialised would make any future
-  // change to that logic read indeterminate memory.
-  memset(ch, ' ', n);
-  memset(sch, ' ', n);
-  memset(fg, 0, n * sizeof(Color));
-  memset(sfg, 0, n * sizeof(Color));
-  memset(bg, 0, n * sizeof(Color));
-  memset(sbg, 0, n * sizeof(Color));
-  return s;
+/**
+ * @brief Resize the surface to match the terminal window, if it has changed.
+ *
+ * Call this once at the top of each frame to make the surface follow the
+ * window. It is a cheap ioctl plus a comparison when nothing has changed,
+ * which is the common case.
+ *
+ * @param s Screen to fit to the window. Must not be NULL.
+ * @return 1 if the surface changed size, 0 if it did not -- including when the
+ *         size query fails, or the planes could not grow. Either way the
+ *         surface is left in a drawable state.
+ *
+ * @note Polling beats a SIGWINCH handler here: the frame loop already wakes at
+ *       least every ~100ms (term_read_keys()), and a handler would have to
+ *       hand the work back to the loop through a volatile flag anyway to avoid
+ *       allocating inside a signal.
+ * @note Anything cached from Screen::w or Screen::h is stale after a 1 --
+ *       recompute layout when this returns true.
+ */
+static inline int screen_sync_size(Screen *s) {
+  int cols = s->w, rows = s->h;
+  if (term_size(&cols, &rows) == -1)
+    return 0;
+  if (cols == s->w && rows == s->h)
+    return 0;
+  return screen_resize(s, cols, rows);
 }
 
 // --- writes -----------------------------------------------------------------
@@ -1113,12 +1600,3 @@ static inline void screen_present(Screen *s) {
 static inline void screen_invalidate(Screen *s) { s->prev_valid = 0; }
 
 #endif
-
-
-
-
-
-
-
-
-
