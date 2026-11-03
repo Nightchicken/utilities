@@ -406,9 +406,8 @@ static inline void term_set_read_timeout(int tenths) {
  * @param k   The event. Keys with a character (letters, Enter, Esc, Tab,
  *            Backspace, Ctrl-letter) give that byte; arrows and the editing
  *            keys give their xterm escape sequences.
- * @param out Room for at least 4 bytes.
- * @return Bytes written, 0 for keys with no POSIX equivalent (Shift alone,
- *         function keys).
+ * @param out Room for at least 8 bytes.
+ * @return Bytes written, 0 for keys with no POSIX equivalent (Shift alone).
  *
  * @note Internal to term_read_keys(). Mapping here rather than relying on
  *       ENABLE_VIRTUAL_TERMINAL_INPUT keeps it working on consoles without VT
@@ -423,7 +422,26 @@ static inline int term_key_bytes(const KEY_EVENT_RECORD *k, char *out) {
   case VK_LEFT: seq = "\x1b[D"; break;
   case VK_HOME: seq = "\x1b[H"; break;
   case VK_END: seq = "\x1b[F"; break;
+  case VK_INSERT: seq = "\x1b[2~"; break;
   case VK_DELETE: seq = "\x1b[3~"; break;
+  case VK_PRIOR: seq = "\x1b[5~"; break;
+  case VK_NEXT: seq = "\x1b[6~"; break;
+  case VK_F1: seq = "\x1bOP"; break;
+  case VK_F2: seq = "\x1bOQ"; break;
+  case VK_F3: seq = "\x1bOR"; break;
+  case VK_F4: seq = "\x1bOS"; break;
+  case VK_F5: seq = "\x1b[15~"; break;
+  case VK_F6: seq = "\x1b[17~"; break;
+  case VK_F7: seq = "\x1b[18~"; break;
+  case VK_F8: seq = "\x1b[19~"; break;
+  case VK_F9: seq = "\x1b[20~"; break;
+  case VK_F10: seq = "\x1b[21~"; break;
+  case VK_F11: seq = "\x1b[23~"; break;
+  case VK_F12: seq = "\x1b[24~"; break;
+  case VK_TAB:
+    if (k->dwControlKeyState & SHIFT_PRESSED)
+      seq = "\x1b[Z";
+    break;
   case VK_BACK: out[0] = 127; return 1;
   }
   if (seq) {
@@ -1598,5 +1616,67 @@ static inline void screen_present(Screen *s) {
  *       state that is no longer true.
  */
 static inline void screen_invalidate(Screen *s) { s->prev_valid = 0; }
+
+// ---------------------------------------------------------------------------
+// Keys -- what term_read_keys() hands back for each keypress
+// ---------------------------------------------------------------------------
+
+/*
+ * Single-byte keys are chars: compare with keys[i] == KEY_ENTER.
+ * Multi-byte keys are escape-sequence strings: compare with term_key_match().
+ * KEY_ESC is also the first byte of every sequence, so check sequences first.
+ */
+#define KEY_ESC 0x1b
+#define KEY_ENTER '\r'
+#define KEY_TAB '\t'
+#define KEY_BACKSPACE 0x7f
+#define KEY_SPACE ' '
+/** @brief Byte for Ctrl+letter, e.g. KEY_CTRL('c') == 0x03. */
+#define KEY_CTRL(c) ((char)((c) & 0x1f))
+
+#define KEY_UP_ARROW "\x1b[A"
+#define KEY_DOWN_ARROW "\x1b[B"
+#define KEY_RIGHT_ARROW "\x1b[C"
+#define KEY_LEFT_ARROW "\x1b[D"
+#define KEY_HOME "\x1b[H"
+#define KEY_END "\x1b[F"
+#define KEY_INSERT "\x1b[2~"
+#define KEY_DELETE "\x1b[3~"
+#define KEY_PAGE_UP "\x1b[5~"
+#define KEY_PAGE_DOWN "\x1b[6~"
+#define KEY_SHIFT_TAB "\x1b[Z"
+#define KEY_F1 "\x1bOP"
+#define KEY_F2 "\x1bOQ"
+#define KEY_F3 "\x1bOR"
+#define KEY_F4 "\x1bOS"
+#define KEY_F5 "\x1b[15~"
+#define KEY_F6 "\x1b[17~"
+#define KEY_F7 "\x1b[18~"
+#define KEY_F8 "\x1b[19~"
+#define KEY_F9 "\x1b[20~"
+#define KEY_F10 "\x1b[21~"
+#define KEY_F11 "\x1b[23~"
+#define KEY_F12 "\x1b[24~"
+
+/**
+ * @brief Check whether a ::KEY_* sequence starts at buf[*i]; if so, step *i
+ *        past it.
+ *
+ * @code
+ *     for (int i = 0; i < n; ) {
+ *         if (term_key_match(keys, n, &i, KEY_LEFT_ARROW)) x--;
+ *         else if (term_key_match(keys, n, &i, KEY_RIGHT_ARROW)) x++;
+ *         else if (keys[i++] == 'q') running = 0;
+ *     }
+ * @endcode
+ */
+static inline int term_key_match(const char *buf, int n, int *i,
+                                 const char *seq) {
+  int len = (int)strlen(seq);
+  if (*i + len > n || memcmp(buf + *i, seq, (size_t)len) != 0)
+    return 0;
+  *i += len;
+  return 1;
+}
 
 #endif
